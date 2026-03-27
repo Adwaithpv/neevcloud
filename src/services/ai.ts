@@ -24,6 +24,7 @@ const allowedCategories: ExpenseCategory[] = [
 ]
 
 const normalize = (text: string): string => text.trim().toLowerCase()
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models'
 
 const fallbackCategory = (description: string): ExpenseCategory => {
   const normalized = normalize(description)
@@ -38,7 +39,51 @@ const fallbackCategory = (description: string): ExpenseCategory => {
   return 'other'
 }
 
-const hasAiConfig = (): boolean => Boolean(import.meta.env.VITE_OPENAI_API_KEY)
+const hasAiConfig = (): boolean => Boolean(import.meta.env.VITE_GEMINI_API_KEY)
+
+interface GeminiGenerateContentResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{ text?: string }>
+    }
+  }>
+}
+
+const getGeminiText = (data: GeminiGenerateContentResponse): string =>
+  data.candidates?.[0]?.content?.parts?.map((part) => part.text ?? '').join('\n') ?? ''
+
+const callGemini = async (prompt: string): Promise<string | null> => {
+  const apiKey = import.meta.env.GEMINI_API_KEY as string | undefined
+  if (!apiKey) {
+    return null
+  }
+
+  const model = (import.meta.env.VITE_GEMINI_MODEL as string | undefined) ?? 'gemini-1.5-flash'
+  const endpoint = `${GEMINI_BASE_URL}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }],
+        },
+      ],
+    }),
+  })
+
+  if (!response.ok) {
+    return null
+  }
+
+  const data = (await response.json()) as GeminiGenerateContentResponse
+  const text = getGeminiText(data).trim()
+  return text || null
+}
 
 export const categorizeExpense = async (description: string): Promise<ExpenseCategory> => {
   if (!hasAiConfig()) {
@@ -46,38 +91,17 @@ export const categorizeExpense = async (description: string): Promise<ExpenseCat
   }
 
   try {
-    const response = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${import.meta.env.VITE_OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: import.meta.env.VITE_OPENAI_MODEL ?? 'gpt-4.1-mini',
-        input: [
-          {
-            role: 'system',
-            content:
-              'Classify expense descriptions into one category: food, travel, rent, utilities, shopping, entertainment, health, other. Reply with one lowercase category only.',
-          },
-          { role: 'user', content: description },
-        ],
-      }),
-    })
-
-    if (!response.ok) {
+    const text = await callGemini(
+      [
+        'Classify this expense description into exactly one category.',
+        'Allowed categories: food, travel, rent, utilities, shopping, entertainment, health, other.',
+        'Reply with one lowercase word only.',
+        `Description: ${description}`,
+      ].join('\n')
+    )
+    if (!text) {
       return fallbackCategory(description)
     }
-
-    const data = (await response.json()) as {
-      output_text?: string
-      output?: Array<{ content?: Array<{ text?: string }> }>
-    }
-
-    const text =
-      data.output_text ??
-      data.output?.flatMap((item) => item.content ?? []).map((item) => item.text ?? '').join(' ')
-
     const candidate = normalize(text ?? '')
     if (allowedCategories.includes(candidate as ExpenseCategory)) {
       return candidate as ExpenseCategory
@@ -102,39 +126,17 @@ export const generateInsights = async (expenses: Expense[]): Promise<string[]> =
 
   try {
     const summary = buildInsightSummary(expenses)
-    const response = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${import.meta.env.VITE_OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: import.meta.env.VITE_OPENAI_MODEL ?? 'gpt-4.1-mini',
-        input: [
-          {
-            role: 'system',
-            content:
-              'You are an expense analyst. Return exactly 3 concise insights as numbered lines. Keep each line under 16 words.',
-          },
-          {
-            role: 'user',
-            content: JSON.stringify(summary),
-          },
-        ],
-      }),
-    })
-
-    if (!response.ok) {
+    const text = await callGemini(
+      [
+        'You are an expense analyst.',
+        'Return exactly 3 concise insights as numbered lines.',
+        'Each line must be fewer than 16 words.',
+        `Data: ${JSON.stringify(summary)}`,
+      ].join('\n')
+    )
+    if (!text) {
       return fallback
     }
-
-    const data = (await response.json()) as {
-      output_text?: string
-      output?: Array<{ content?: Array<{ text?: string }> }>
-    }
-    const text =
-      data.output_text ??
-      data.output?.flatMap((item) => item.content ?? []).map((item) => item.text ?? '').join('\n')
     const lines = (text ?? '')
       .split('\n')
       .map((line) => line.replace(/^\d+[).\s-]*/, '').trim())
